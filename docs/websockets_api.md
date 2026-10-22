@@ -339,6 +339,42 @@ commissioning); `null` counts as not given. Without it matter.js searches for 3 
 limited. A device that is found but not reached in time fails with `NodeCommissionFailed` and `reason` `timeout`; a device
 never found, with `reason` `not-discovered`.
 
+`ble_proxy_id` (optional) commissions over one BLE proxy client connected to `/ble`, named by the `proxy_id` it got
+in its handshake (see [BLE proxy protocol](ble-proxy-protocol.md#selecting-one-proxy-for-commissioning)). It is a
+string of 1 to 128 characters and needs `network_only` absent or `false`. Send it only when `server_info` has
+`ble_proxy_selection: true`; otherwise the server fails it with `InvalidArguments`. While the attempt runs, only the
+selected proxy is used. A selected attempt while another one runs, or while a BLE scan is active, fails with
+`107 BleProxyBusy`. Closing the WebSocket connection that sent the command, or disconnecting the selected proxy, ends
+the attempt.
+
+```json
+{
+  "message_id": "1",
+  "command": "commission_with_code",
+  "args": {
+    "code": "MT:Y.ABCDEFG123456789",
+    "ble_proxy_id": "6f1c0d0e-3b8a-4f0e-9a51-1f2d3c4b5a69"
+  }
+}
+```
+
+**cancel_commissioning** - Cancel a `commission_with_code` with `ble_proxy_id`
+
+```json
+{
+  "message_id": "1",
+  "command": "cancel_commissioning",
+  "args": {
+    "ble_proxy_id": "6f1c0d0e-3b8a-4f0e-9a51-1f2d3c4b5a69"
+  }
+}
+```
+
+Response: `{ "canceled": true }`. The server answers once the attempt has settled and the proxy is released. Only the
+connection that started the attempt can cancel it. The response is `canceled: false` when that connection has no
+attempt on this proxy, for a repeated cancel, and when commissioning completed anyway (for example because PASE had
+already finished); the device is then commissioned.
+
 **commission_on_network** - Commission a device already on the network
 
 Commission using setup PIN code with optional filtering by discriminator, vendor ID, product or device type.
@@ -2392,6 +2428,7 @@ Error codes match the [Python Matter Server](https://github.com/matter-js/python
 | 104 | CameraStreamInUse | OHF extension. `camera_release_stream` targeted a stream a listener still references. `details` is a JSON string: `{"message": string, "stream_id": number, "reference_count"?: number}`. See [camera error details](#camera-error-details) |
 | 105 | CameraNotSupported | OHF extension. The endpoint lacks a cluster the camera command needs. `details` is a JSON string: `{"message": string, "missing_clusters": number[]}`. See [camera error details](#camera-error-details) |
 | 106 | CameraPrivacyMode | OHF extension. The camera's privacy switch forbids the call. `details` is a JSON string: `{"message": string, "modes": string[], "device_status": number}`. See [camera error details](#camera-error-details) |
+| 107 | BleProxyBusy | OHF extension. `commission_with_code` with `ble_proxy_id` found the BLE proxies busy: another selected attempt holds them, also while it settles after a cancel, or a BLE scan is active. Retry once they are released |
 
 ### Camera error details
 

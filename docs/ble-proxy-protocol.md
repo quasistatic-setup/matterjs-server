@@ -44,7 +44,7 @@ BLE proxies) to a Matter.js server for BLE-based device commissioning.
 Any number of clients may be connected at the same time, each with its own BLE hardware.
 `connection_handle` values are assigned by the client and are only unique within one client
 connection, so the server never compares handles across clients. Work is distributed as
-follows:
+follows when no proxy is explicitly selected:
 
 - **Scanning is broadcast.** `start_scan` and `stop_scan` go to every connected client. A
   client that completes its handshake while a scan is already active is sent `start_scan`
@@ -60,6 +60,54 @@ follows:
 - **Ownership expires.** A peripheral that no client reported for 15 minutes, counted from
   its last report or the end of the last scan, whichever is later, is dropped when the next
   scan starts and must be rediscovered.
+
+### Selecting one proxy for commissioning
+
+Clients may opt into the `proxy_identity` extension without changing protocol version 1:
+
+```json
+{"type":"hello","version":1,"features":["proxy_identity"]}
+```
+
+A supporting server replies with `features: ["proxy_identity"]` and a nonempty `proxy_id`.
+The identifier belongs to that exact WebSocket connection and changes on every reconnect.
+Clients that omit the extension continue receiving the original handshake shape.
+The identifier is a routing hint, not an authentication credential.
+
+The main `/ws` API advertises `server_info.ble_proxy_selection: true` only when selected routing
+is enabled. A controller may then send `commission_with_code` with `args.ble_proxy_id` and
+`network_only: false`. Clients must check the capability before sending this optional field;
+older servers must not silently commission through a different adapter.
+
+Selection reserves BLE commissioning for one operation. During that operation:
+
+- Scans, discovery acceptance and new GATT connections use only the selected proxy.
+- A device must advertise valid Matter service data through that connection during the operation.
+  Cached SDK discoveries, old ownership and advertisements from other proxies are insufficient.
+- Existing channels remain attached to their original proxy; unrelated scanning or new channel
+  opens are rejected while the selection is active. A pending legacy channel open also prevents
+  selection from beginning.
+- Disconnecting the selected proxy or the requesting control connection cancels the operation.
+  Reconnecting never resumes a previous selection and there is no adapter fallback. A commissioning
+  that already completed is still reported as successful.
+- The lease remains held until commissioning has settled, channel opens still in progress have
+  stopped and disconnected, channels have closed and scan cleanup has completed, including failure
+  and cancellation paths. An open stops at its next step once the operation ends or the caller
+  aborts it; a command already sent to the proxy is awaited, not withdrawn. A new selected
+  `commission_with_code` while the lease is held fails with error code 107 (`BleProxyBusy`).
+
+A controller can explicitly cancel its own operation using the main API command
+`cancel_commissioning` with `args.ble_proxy_id`. The response is
+`{"canceled": true}` only for an operation owned by that same control WebSocket connection.
+Cancellation is acknowledged after cleanup has settled. If commissioning still completes, for
+example because PASE had already finished, the response is `canceled: false` and the device is
+commissioned. Another connection, even with the same application-level user, cannot cancel it.
+Repeated requests return `canceled: false`.
+This command cancels the in-flight operation; it does not remove commissioned nodes or fabrics.
+
+Authenticated frontends should relay `/ble` through their existing authenticated server API,
+bind the relay and commissioning request to the owning connection, and derive the upstream
+endpoint from server configuration rather than accepting arbitrary caller-supplied URLs.
 
 ### Liveness
 

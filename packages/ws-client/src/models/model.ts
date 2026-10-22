@@ -1002,6 +1002,8 @@ export interface APICommands {
     commission_with_code: {
         requestArgs: {
             code: string;
+            /** Requires server_info.ble_proxy_selection; scoped to this commissioning operation. */
+            ble_proxy_id?: string;
             network_only?: boolean;
             wifi_credentials_id?: string;
             thread_dataset_id?: string;
@@ -1012,6 +1014,10 @@ export interface APICommands {
             discovery_timeout_s?: number;
         };
         response: MatterNodeData;
+    };
+    cancel_commissioning: {
+        requestArgs: { ble_proxy_id: string };
+        response: { canceled: boolean };
     };
     commission_on_network: {
         requestArgs: {
@@ -1538,6 +1544,8 @@ export interface ServerInfoMessage {
     bluetooth_enabled: boolean;
     /** True when BLE proxy mode is enabled (server exposes `/ble` WebSocket endpoint for a remote proxy client). Note: Only available with OHF Matter Server, not Python Matter Server. */
     ble_proxy_enabled?: boolean;
+    /** Explicit proxy selection and cancellation, negotiated independently of schema version. */
+    ble_proxy_selection?: boolean;
     /** The controller's own operational (CASE) node id. Note: Only available with OHF Matter Server, not Python Matter Server. */
     controller_node_id?: number | bigint;
 }
@@ -1872,6 +1880,8 @@ export const CAMERA_NOT_SUPPORTED_ERROR_CODE = 105;
  * `details` are {@link CameraPrivacyModeErrorDetails}.
  */
 export const CAMERA_PRIVACY_MODE_ERROR_CODE = 106;
+/** OHF extension: the selected BLE proxy is still held by another commissioning attempt; retry later. */
+export const BLE_PROXY_BUSY_ERROR_CODE = 107;
 
 /** ICD controller-side state for a node. Note: Only available with OHF Matter Server. */
 export interface IcdStateData {

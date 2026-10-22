@@ -4,8 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { WebServerHandler } from "@matter-server/ws-controller";
+import { ServerError, type WebServerHandler } from "@matter-server/ws-controller";
 import { Logger, Minutes, Observable, Time, Timestamp } from "@matter/main";
+import { BleError } from "@matter/main/protocol";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { createServer } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
 import { BleProxyConnection } from "./BleProxyConnection.js";
@@ -20,6 +22,15 @@ import {
 } from "./BleProxyProtocol.js";
 
 type HttpServer = ReturnType<typeof createServer>;
+
+interface ProxySelection {
+    connection: BleProxyConnection;
+    seen: Set<string>;
+    abort: AbortController;
+    signal: AbortSignal;
+    channels: Set<{ connected: boolean; close(): Promise<void> }>;
+    opening: Set<Promise<unknown>>;
+}
 
 const logger = Logger.get("BleProxyHandler");
 
@@ -47,6 +58,9 @@ export class BleProxyHandler implements WebServerHandler {
     #removeUpgradeListeners: (() => void)[] = [];
     #connections = new Set<BleProxyConnection>();
     #closed = false;
+    #selection?: ProxySelection;
+    #openingChannels = 0;
+    readonly #selectionContext = new AsyncLocalStorage<ProxySelection>();
 
     /** Active scan intent + args, so clients joining mid-scan can be synced. */
     #scanActive = false;
@@ -69,10 +83,126 @@ export class BleProxyHandler implements WebServerHandler {
     readonly scanStopped = new Observable<[reason: string]>();
 
     get connected(): boolean {
+        if (this.#selection) {
+            return this.#selection.connection.connected && !this.#selection.signal.aborted;
+        }
         for (const c of this.#connections) {
             if (c.connected) return true;
         }
         return false;
+    }
+
+    /**
+     * Keep one commissioning operation on its explicitly selected proxy connection.
+     * The operation must observe signal and await its work before settling; its own result decides
+     * success. Retain the lease until it has settled, even after abort, so a late task cannot inherit
+     * a new selection.
+     */
+    async withProxySelection<T>(
+        proxyId: string,
+        operation: (signal: AbortSignal) => Promise<T>,
+        signal?: AbortSignal,
+    ): Promise<T> {
+        signal?.throwIfAborted();
+        if (this.#closed) throw new BleError("BLE proxy handler is closed");
+        if (this.#selection || this.#scanActive || this.#scanning.size || this.#openingChannels) {
+            throw ServerError.bleProxyBusy("BLE proxy is busy");
+        }
+        const connection = [...this.#connections].find(c => c.proxyId === proxyId && c.connected);
+        if (!connection) throw new BleError("Unknown or disconnected BLE proxy");
+        const abort = new AbortController();
+        const selection: ProxySelection = {
+            connection,
+            seen: new Set(),
+            abort,
+            signal: signal ? AbortSignal.any([signal, abort.signal]) : abort.signal,
+            channels: new Set(),
+            opening: new Set(),
+        };
+        this.#selection = selection;
+        return this.#selectionContext.run(selection, async () => {
+            let outcome: { ok: true; value: T } | { ok: false; error: unknown };
+            try {
+                // A completed operation stays a success even if the proxy left afterwards: a commissioned node exists.
+                outcome = { ok: true, value: await operation(selection.signal) };
+            } catch (error) {
+                outcome = { ok: false, error };
+            }
+            // The SDK may have stopped waiting for an open that is still talking to the proxy.
+            abort.abort(new BleError("BLE proxy selection ended"));
+            const cleanupErrors: unknown[] = [];
+            try {
+                await Promise.allSettled(selection.opening);
+                const closed = await Promise.allSettled(
+                    [...selection.channels].filter(c => c.connected).map(c => Promise.resolve().then(() => c.close())),
+                );
+                for (const result of closed) {
+                    if (result.status === "rejected") cleanupErrors.push(result.reason);
+                }
+                await this.stopScan();
+            } catch (error) {
+                cleanupErrors.push(error);
+            } finally {
+                this.#selection = undefined;
+            }
+            if (cleanupErrors.length) {
+                logger.warn(`BLE selection cleanup had ${cleanupErrors.length} failure(s)`, cleanupErrors);
+            }
+            if (!outcome.ok) throw outcome.error;
+            return outcome.value;
+        });
+    }
+
+    /** Only validated advertisements enter the selected operation's freshness set. */
+    recordDiscovery(address: string, connection: BleProxyConnection): boolean {
+        const selection = this.#selection;
+        if (!selection) return true;
+        if (selection.connection !== connection || selection.signal.aborted) return false;
+        selection.seen.add(address);
+        return true;
+    }
+
+    trackChannel(channel: { connected: boolean; close(): Promise<void> }): void {
+        this.#currentSelection()?.channels.add(channel);
+    }
+
+    assertOperationActive(): void {
+        this.#currentSelection()?.signal.throwIfAborted();
+    }
+
+    /** A selection must not start halfway through an existing unselected GATT handshake. */
+    async withChannelOpen<T>(operation: () => Promise<T>): Promise<T> {
+        const selection = this.#currentSelection();
+        selection?.signal.throwIfAborted();
+        this.#openingChannels++;
+        const opening = operation();
+        selection?.opening.add(opening);
+        try {
+            return await opening;
+        } finally {
+            this.#openingChannels--;
+            selection?.opening.delete(opening);
+        }
+    }
+
+    #currentSelection(): ProxySelection | undefined {
+        const context = this.#selectionContext.getStore();
+        if (context !== this.#selection) {
+            throw new BleError("BLE proxy is busy or selection has expired");
+        }
+        return context;
+    }
+
+    #selectedOwner(address: string): BleProxyConnection | undefined {
+        const selection = this.#selection;
+        return selection && !selection.signal.aborted && selection.connection.connected && selection.seen.has(address)
+            ? selection.connection
+            : undefined;
+    }
+
+    /** Discovery callbacks arrive on the WebSocket's IO context, not the operation's async context. */
+    isPeripheralReachable(address: string): boolean {
+        return this.#selection ? this.#selectedOwner(address) !== undefined : this.getOwner(address) !== undefined;
     }
 
     async register(server: HttpServer): Promise<void> {
@@ -153,6 +283,10 @@ export class BleProxyHandler implements WebServerHandler {
      * not been processed yet hands ownership to a connected seer, so the peripheral stays reachable meanwhile.
      */
     getOwner(address: string): BleProxyConnection | undefined {
+        const selection = this.#currentSelection();
+        if (selection) {
+            return this.#selectedOwner(address);
+        }
         const entry = this.#owners.get(address);
         if (entry === undefined) return undefined;
         if (!entry.owner.connected) {
@@ -171,6 +305,8 @@ export class BleProxyHandler implements WebServerHandler {
     }
 
     async startScan(args: StartScanArgs): Promise<void> {
+        const selection = this.#currentSelection();
+        selection?.signal.throwIfAborted();
         if (!this.#scanActive) {
             this.#forgetUnreportedOwners();
         }
@@ -178,7 +314,7 @@ export class BleProxyHandler implements WebServerHandler {
         this.#scanArgs = args;
         const sends = new Array<Promise<unknown>>();
         for (const connection of this.#connections) {
-            if (connection.connected) {
+            if (connection.connected && (!selection || connection === selection.connection)) {
                 this.#scanning.add(connection);
                 sends.push(
                     connection.sendCommand(BleProxyCommand.StartScan, args).catch(err => {
@@ -191,11 +327,12 @@ export class BleProxyHandler implements WebServerHandler {
     }
 
     async stopScan(): Promise<void> {
+        const selection = this.#currentSelection();
         this.#scanActive = false;
         this.#scanStoppedAt = Time.nowUs;
         const sends = new Array<Promise<unknown>>();
         for (const connection of this.#connections) {
-            if (connection.connected) {
+            if (connection.connected && (!selection || connection === selection.connection)) {
                 sends.push(
                     connection.sendCommand(BleProxyCommand.StopScan).catch(err => {
                         if (isErrorCode(err, BleProxyErrorCode.NotScanning)) {
@@ -213,7 +350,7 @@ export class BleProxyHandler implements WebServerHandler {
 
     #onHandshakeCompleted(connection: BleProxyConnection): void {
         this.connectionEstablished.emit();
-        if (this.#scanActive && this.#scanArgs) {
+        if (this.#scanActive && this.#scanArgs && !this.#selection) {
             this.#scanning.add(connection);
             connection.sendCommand(BleProxyCommand.StartScan, this.#scanArgs).catch(err => {
                 this.#onStartScanRejected(connection, err);
@@ -281,6 +418,9 @@ export class BleProxyHandler implements WebServerHandler {
     }
 
     #onConnectionClosed(connection: BleProxyConnection): void {
+        if (this.#selection?.connection === connection) {
+            this.#selection.abort.abort(new BleError("Selected BLE proxy disconnected"));
+        }
         this.#connections.delete(connection);
         this.#markNotScanning(connection, "client disconnected");
 

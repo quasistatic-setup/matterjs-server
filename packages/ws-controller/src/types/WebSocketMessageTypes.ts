@@ -114,6 +114,8 @@ export enum ServerErrorCode {
     CameraNotSupported = 105,
     /** OHF extension: the camera's privacy switch forbids the session or the snapshot. */
     CameraPrivacyMode = 106,
+    /** OHF extension: the selected BLE proxy is still held by another commissioning attempt; retry later. */
+    BleProxyBusy = 107,
 }
 
 interface CameraStreamIncompatibleFacts {
@@ -257,6 +259,10 @@ export class ServerError extends Error {
 
     static updateError(message: string, cause?: Error): ServerError {
         return new ServerError(ServerErrorCode.UpdateError, message, cause);
+    }
+
+    static bleProxyBusy(message: string): ServerError {
+        return new ServerError(ServerErrorCode.BleProxyBusy, message);
     }
 
     static otaUploadError(message: string, cause?: Error): ServerError {

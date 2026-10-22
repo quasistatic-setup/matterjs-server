@@ -12,12 +12,14 @@
 // ─── Protocol Version ────────────────────────────────────────────────────────
 
 export const BLE_PROXY_PROTOCOL_VERSION = 1;
+export const BLE_PROXY_IDENTITY_FEATURE = "proxy_identity";
 
 // ─── Handshake Messages ──────────────────────────────────────────────────────
 
 export interface HelloMessage {
     type: "hello";
     version: number;
+    features?: string[];
 }
 
 export interface HelloResponseMessage {
@@ -25,6 +27,8 @@ export interface HelloResponseMessage {
     version: number;
     error?: string;
     message?: string;
+    features?: string[];
+    proxy_id?: string;
 }
 
 export type HandshakeMessage = HelloMessage | HelloResponseMessage;

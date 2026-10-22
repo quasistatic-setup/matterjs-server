@@ -16,6 +16,7 @@ import {
     BLE_PROXY_PROTOCOL_VERSION,
     type BleProxyCommandName,
     type CommandMessage,
+    type HelloResponseMessage,
     encodeBinaryFrame,
 } from "../src/BleProxyProtocol.js";
 
@@ -27,14 +28,21 @@ export class BleProxyTestClient {
     #commandErrors = new Map<BleProxyCommandName, { error: string; message: string }>();
     #receivedCommands: CommandMessage[] = [];
     #commandWaiters: Array<{ command: string; resolve: (msg: CommandMessage) => void }> = [];
+    helloResponse?: HelloResponseMessage;
 
-    async connect(url: string): Promise<void> {
+    async connect(url: string, features?: string[]): Promise<void> {
         return new Promise<void>((resolve, reject) => {
             const ws = new WebSocket(url);
             this.#ws = ws;
 
             ws.on("open", () => {
-                ws.send(JSON.stringify({ type: "hello", version: BLE_PROXY_PROTOCOL_VERSION }));
+                ws.send(
+                    JSON.stringify({
+                        type: "hello",
+                        version: BLE_PROXY_PROTOCOL_VERSION,
+                        ...(features ? { features } : {}),
+                    }),
+                );
             });
 
             let handshakeDone = false;
@@ -53,6 +61,7 @@ export class BleProxyTestClient {
                             return;
                         }
                         handshakeDone = true;
+                        this.helloResponse = msg;
                         resolve();
                     }
                     return;

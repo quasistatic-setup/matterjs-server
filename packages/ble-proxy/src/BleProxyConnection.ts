@@ -16,8 +16,10 @@ import {
     withTimeout,
 } from "@matter/main";
 import { Mark } from "@matter/main/protocol";
+import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 import {
+    BLE_PROXY_IDENTITY_FEATURE,
     BLE_PROXY_PROTOCOL_VERSION,
     BleProxyCommandError,
     decodeBinaryFrame,
@@ -75,6 +77,8 @@ const LIVENESS_TIMEOUT = Seconds(45);
 export class BleProxyConnection {
     readonly #ws: WebSocket;
     readonly #id = generateConnectionId();
+    /** Connection identity for explicit routing, never the short, recycled log ID. */
+    readonly proxyId = randomUUID();
     #handshakeComplete = false;
     #closedEmitted = false;
     /** Cleanup is terminal: a torn-down connection must never handshake again on a late `hello`. */
@@ -250,7 +254,14 @@ export class BleProxyConnection {
 
         this.#handshakeComplete = true;
         this.#startLivenessCheck();
-        this.#ws.send(JSON.stringify({ type: "hello_response", version: BLE_PROXY_PROTOCOL_VERSION }));
+        const identityRequested = Array.isArray(hello.features) && hello.features.includes(BLE_PROXY_IDENTITY_FEATURE);
+        this.#ws.send(
+            JSON.stringify({
+                type: "hello_response",
+                version: BLE_PROXY_PROTOCOL_VERSION,
+                ...(identityRequested ? { features: [BLE_PROXY_IDENTITY_FEATURE], proxy_id: this.proxyId } : {}),
+            }),
+        );
         logger.info(`[${this.#id}] BLE proxy handshake complete (version ${BLE_PROXY_PROTOCOL_VERSION})`);
         this.handshakeCompleted.emit();
     }

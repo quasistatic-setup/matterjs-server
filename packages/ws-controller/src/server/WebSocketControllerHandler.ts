@@ -57,6 +57,7 @@ import { TestNodeCommandHandler } from "../controller/TestNodeCommandHandler.js"
 import { dropWebRtcSessionTracking, invokeEndSession } from "../controller/webRtcSessionTracking.js";
 import { VendorIds } from "../data/VendorIDs.js";
 import { ClusterMap, ClusterMapEntry } from "../model/ModelMapper.js";
+import type { BleProxyCommissioning } from "../types/BleProxyCommissioning.js";
 import { CommissioningRequest, InteractionSubscription } from "../types/CommandHandler.js";
 import { HttpServer, WebServerHandler } from "../types/WebServer.js";
 import {
@@ -297,8 +298,18 @@ export class WebSocketControllerHandler implements WebServerHandler {
     #fabricLabelOwner?: WebSocketConnection;
     /** Subscriptions opened with `subscribe`, keyed by {@link subscriptionKey}, each owned by the connection that opened it. */
     #interactionSubscriptions = new Map<string, OwnedSubscription>();
+    readonly #bleProxy?: BleProxyCommissioning;
+    readonly #bleCommissions = new Map<
+        WebSocketConnection,
+        { proxyId: string; abort: AbortController; settled: Promise<boolean> }
+    >();
 
-    constructor(controller: MatterController, config: ConfigStorage, serverVersion: string) {
+    constructor(
+        controller: MatterController,
+        config: ConfigStorage,
+        serverVersion: string,
+        bleProxy?: BleProxyCommissioning,
+    ) {
         this.#controller = controller;
         this.#commandHandler = controller.commandHandler;
         this.#testNodeHandler = new TestNodeCommandHandler();
@@ -309,6 +320,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
         };
         this.#config = config;
         this.#serverVersion = serverVersion;
+        this.#bleProxy = bleProxy;
     }
 
     /**
@@ -448,6 +460,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
                 getNodeCount: () => this.#commandHandler.getNodeIds().length,
             });
             this.#connections.add(connection);
+            const connectionAbort = new AbortController();
 
             // Builds a full node snapshot frame lazily, at actual send time, so coalesced-away updates
             // never pay the (heavy) collect cost and a trailing update for a removed node is skipped.
@@ -794,6 +807,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
                     return;
                 }
                 connectionClosed = true;
+                connectionAbort.abort(new Error("Commissioning client disconnected"));
                 pendingNodeUpdated.clear();
                 logger.info(`[${connId}] WebSocket connection closed`);
                 observers.close();
@@ -826,6 +840,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
                     data.toString(),
                     optInToEventsFor,
                     startingSessions,
+                    connectionAbort.signal,
                     req?.socket?.remoteAddress,
                 )
                     .then(({ response, enableListeners, afterResponse }) => {
@@ -913,6 +928,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
         data: string,
         optInToEventsFor: (command: string) => void,
         startingSessions: StartingSessionSignalling,
+        connectionSignal: AbortSignal,
         peerAddress?: string,
     ): Promise<{
         response: ErrorResultMessage | SuccessResultMessage;
@@ -950,7 +966,10 @@ export class WebSocketControllerHandler implements WebServerHandler {
                     result = this.#handleGetFabricLabel(args);
                     break;
                 case "commission_with_code":
-                    result = await this.#handleCommissionWithCode(args);
+                    result = await this.#handleCommissionWithCode(args, connection, connectionSignal);
+                    break;
+                case "cancel_commissioning":
+                    result = await this.#handleCancelCommissioning(args, connection);
                     break;
                 case "commission_on_network":
                     result = await this.#handleCommissionOnNetwork(args);
@@ -1173,6 +1192,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
             thread_credentials_set: !!this.#config.threadDataset,
             bluetooth_enabled: this.#commandHandler.bleEnabled,
             ble_proxy_enabled: this.#commandHandler.bleProxyEnabled,
+            ble_proxy_selection: !!this.#bleProxy && this.#commandHandler.bleProxyEnabled,
             controller_node_id: this.#commandHandler.getCommissionerNodeId(),
         };
     }
@@ -1300,8 +1320,42 @@ export class WebSocketControllerHandler implements WebServerHandler {
         );
     }
 
-    async #handleCommissionWithCode(args: ArgsOf<"commission_with_code">): Promise<ResponseOf<"commission_with_code">> {
-        const { code, network_only, wifi_credentials_id, thread_dataset_id } = args;
+    #validateProxyId(value: unknown): string {
+        if (typeof value !== "string" || !value.length || value.length > 128) {
+            throw ServerError.invalidArguments("ble_proxy_id must be a nonempty string of at most 128 characters");
+        }
+        return value;
+    }
+
+    async #handleCancelCommissioning(
+        args: ArgsOf<"cancel_commissioning">,
+        connection: WebSocketConnection,
+    ): Promise<ResponseOf<"cancel_commissioning">> {
+        const proxyId = this.#validateProxyId(args.ble_proxy_id);
+        const active = this.#bleCommissions.get(connection);
+        if (!active || active.proxyId !== proxyId) return { canceled: false };
+        const requested = !active.abort.signal.aborted;
+        if (requested) active.abort.abort(new Error("Commissioning canceled by caller"));
+        // Past PASE the controller may finish regardless; then the device is commissioned and nothing was canceled.
+        const completed = await active.settled;
+        return { canceled: requested && !completed };
+    }
+
+    async #handleCommissionWithCode(
+        args: ArgsOf<"commission_with_code">,
+        connection: WebSocketConnection,
+        connectionSignal: AbortSignal,
+    ): Promise<ResponseOf<"commission_with_code">> {
+        const { code, network_only, wifi_credentials_id, thread_dataset_id, ble_proxy_id } = args;
+        if (ble_proxy_id !== undefined) {
+            this.#validateProxyId(ble_proxy_id);
+            if (!this.#bleProxy || !this.#commandHandler.bleProxyEnabled) {
+                throw ServerError.invalidArguments("Explicit BLE proxy selection is not supported");
+            }
+            if (network_only !== undefined && network_only !== false) {
+                throw ServerError.invalidArguments("BLE proxy selection requires network_only false");
+            }
+        }
         const discoveryTimeout = discoveryTimeoutOf(args.discovery_timeout_s);
 
         const wifiId = wifi_credentials_id ?? ConfigStorage.DEFAULT_CREDENTIAL_ID;
@@ -1334,19 +1388,45 @@ export class WebSocketControllerHandler implements WebServerHandler {
             }
         }
 
-        // Ensure certificates are loaded and initialized
-        await this.#controller.certificateService();
+        const commission = async (abort?: AbortSignal) => {
+            abort?.throwIfAborted();
+            await this.#controller.certificateService();
+            abort?.throwIfAborted();
+            const nodeId = await this.#commissionWithRetry(nodeId => ({
+                nodeId,
+                onNetworkOnly: network_only,
+                discoveryTimeout,
+                ...(isQrCode(code) ? { qrCode: code } : { manualCode: code }),
+                wifiCredentials,
+                threadCredentials,
+                abort,
+            }));
+            return this.#collectNodeDetails(nodeId);
+        };
+        if (ble_proxy_id === undefined) return commission();
 
-        const nodeId = await this.#commissionWithRetry(nodeId => ({
-            nodeId,
-            onNetworkOnly: network_only,
-            discoveryTimeout,
-            ...(isQrCode(code) ? { qrCode: code } : { manualCode: code }),
-            wifiCredentials,
-            threadCredentials,
-        }));
-
-        return this.#collectNodeDetails(nodeId);
+        const abort = new AbortController();
+        let resolveSettled!: (completed: boolean) => void;
+        const settled = new Promise<boolean>(resolve => {
+            resolveSettled = resolve;
+        });
+        const active = { proxyId: ble_proxy_id, abort, settled };
+        let completed = false;
+        return this.#bleProxy!
+            .withProxySelection(
+                ble_proxy_id,
+                async signal => {
+                    this.#bleCommissions.set(connection, active);
+                    const result = await commission(signal);
+                    completed = true;
+                    return result;
+                },
+                AbortSignal.any([connectionSignal, abort.signal]),
+            )
+            .finally(() => {
+                if (this.#bleCommissions.get(connection) === active) this.#bleCommissions.delete(connection);
+                resolveSettled(completed);
+            });
     }
 
     #handleParseOnboardingPayload(args: ArgsOf<"parse_onboarding_payload">): ResponseOf<"parse_onboarding_payload"> {

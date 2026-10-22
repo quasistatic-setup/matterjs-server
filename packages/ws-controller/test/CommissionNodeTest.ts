@@ -123,6 +123,32 @@ describe("commissionNode", () => {
         expect(handler.isNodeIdInUse(NODE_ID)).equals(true);
     });
 
+    it("does not commission a device when the caller's abort signal has already fired", async () => {
+        const abort = new AbortController();
+        abort.abort(new Error("selected proxy disconnected"));
+        const error = await failureOf(() =>
+            commissioning(() => handler.commissionNode({ ...request(), abort: abort.signal })),
+        );
+        expect(error.code).equals(ServerErrorCode.NodeCommissionFailed);
+        expect(handler.isNodeIdInUse(NODE_ID)).equals(false);
+    });
+
+    it("cancels an outstanding SDK discovery and preserves a clean node registry", async () => {
+        const abort = new AbortController();
+        const error = await failureOf(() =>
+            commissioning(async () => {
+                const pending = handler.commissionNode({ ...request(), longDiscriminator: 0xfff, abort: abort.signal });
+                const observed = pending.catch(error => {
+                    throw error;
+                });
+                abort.abort(new Error("selected proxy lost during discovery"));
+                return observed;
+            }),
+        );
+        expect(error.code).equals(ServerErrorCode.NodeCommissionFailed);
+        expect(handler.isNodeIdInUse(NODE_ID)).equals(false);
+    });
+
     it("commissions a device at the address the caller supplied", async () => {
         // A discriminator no advertisement carries, so only the supplied address can reach this device:
         // falling back to discovery would find nothing.

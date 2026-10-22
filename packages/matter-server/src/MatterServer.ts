@@ -232,7 +232,7 @@ async function start() {
         });
     }
 
-    const wsHandler = new WebSocketControllerHandler(controller, config, MATTER_SERVER_VERSION);
+    const wsHandler = new WebSocketControllerHandler(controller, config, MATTER_SERVER_VERSION, bleProxyHandler);
     const handlers: WebServerHandler[] = [new HealthHandler(wsHandler), wsHandler];
     const reservedPaths = new Array<string>();
     if (!cliOptions.disableOta) {

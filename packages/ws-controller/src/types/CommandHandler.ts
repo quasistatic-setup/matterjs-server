@@ -57,6 +57,8 @@ export type CommissioningRequest = {
     onNetworkOnly?: boolean;
     /** Bounds discovery and PASE; the attempt at `knownAddress` keeps the matter.js PASE limit. */
     discoveryTimeout?: Duration;
+    /** Cancels discovery/PASE when the selected proxy or requesting connection disappears. */
+    abort?: AbortSignal;
     wifiCredentials?: ControllerCommissioningFlowOptions["wifiNetwork"];
     threadCredentials?: ControllerCommissioningFlowOptions["threadNetwork"];
 } & (

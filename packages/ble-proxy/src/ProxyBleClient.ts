@@ -5,7 +5,7 @@
  */
 
 import { createPromise, Logger, Seconds, withTimeout } from "@matter/main";
-import { BleError, type BleScannerClient, MatterBle } from "@matter/main/protocol";
+import { BleError, type BleScannerClient, BtpCodec, MatterBle } from "@matter/main/protocol";
 import type { BleProxyConnection } from "./BleProxyConnection.js";
 import type { BleProxyHandler } from "./BleProxyHandler.js";
 import type { DeviceDiscoveredData } from "./BleProxyProtocol.js";
@@ -43,8 +43,8 @@ export class ProxyBleClient implements BleScannerClient {
     #deviceDiscoveredCallback: ((peripheral: ProxyPeripheral, matterServiceData: Uint8Array) => void) | undefined;
     #isScanning = false;
 
-    readonly #deviceDiscoveredObserver = (data: DeviceDiscoveredData, _connection: BleProxyConnection) => {
-        this.#handleDeviceDiscovered(data);
+    readonly #deviceDiscoveredObserver = (data: DeviceDiscoveredData, connection: BleProxyConnection) => {
+        this.#handleDeviceDiscovered(data, connection);
     };
 
     readonly #scanStoppedObserver = (reason: string) => {
@@ -63,10 +63,11 @@ export class ProxyBleClient implements BleScannerClient {
     }
 
     isPeripheralReachable(address: string): boolean {
-        return this.#handler.getOwner(address) !== undefined;
+        return this.#handler.isPeripheralReachable(address);
     }
 
     async startScanning(): Promise<void> {
+        this.#handler.assertOperationActive();
         if (this.#isScanning) {
             return;
         }
@@ -109,7 +110,7 @@ export class ProxyBleClient implements BleScannerClient {
         this.#handler.scanStopped.off(this.#scanStoppedObserver);
     }
 
-    #handleDeviceDiscovered(data: DeviceDiscoveredData): void {
+    #handleDeviceDiscovered(data: DeviceDiscoveredData, connection: BleProxyConnection): void {
         const { address, name, rssi, connectable, service_data } = data;
 
         // service_data keys may arrive in any UUID form the proxy client chose: noble's compact
@@ -143,6 +144,13 @@ export class ProxyBleClient implements BleScannerClient {
             logger.debug(`Peripheral ${address} does not advertise valid Matter service data, ignoring`);
             return;
         }
+
+        try {
+            BtpCodec.decodeBleAdvertisementServiceData(matterServiceData);
+        } catch {
+            return;
+        }
+        if (!this.#handler.recordDiscovery(address, connection)) return;
 
         logger.info(
             `Discovered commissionable device ${address} (${name ?? "unnamed"}) rssi=${rssi ?? "n/a"} via proxy`,

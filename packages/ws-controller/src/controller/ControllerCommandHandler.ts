@@ -1982,6 +1982,7 @@ export class ControllerCommandHandler {
                 onIpNetwork: true,
             },
             nodeId: data.nodeId,
+            abort: data.abort,
             autoSubscribe: !this.#autoSubscriptionDisabled,
             regulatoryLocation: GeneralCommissioning.RegulatoryLocationType.IndoorOutdoor,
             regulatoryCountryCode: "XX",

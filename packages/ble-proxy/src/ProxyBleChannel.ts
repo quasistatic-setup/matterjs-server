@@ -66,7 +66,16 @@ export class ProxyBleCentralInterface implements Transport {
         this.#handler = handler;
     }
 
-    async openChannel(address: ServerAddress): Promise<Channel<Bytes>> {
+    async openChannel(address: ServerAddress, options?: Transport.OpenChannelOptions): Promise<Channel<Bytes>> {
+        return this.#handler.withChannelOpen(() => this.#openChannel(address, options?.abort));
+    }
+
+    async #openChannel(address: ServerAddress, abort?: AbortSignal): Promise<Channel<Bytes>> {
+        // A proxy command cannot be withdrawn, so an abandoned open stops at the next step and disconnects.
+        const ensureActive = () => {
+            abort?.throwIfAborted();
+            this.#handler.assertOperationActive();
+        };
         if (this.#closed) {
             throw new NetworkError("Network interface is closed");
         }
@@ -91,6 +100,7 @@ export class ProxyBleCentralInterface implements Transport {
         logger.debug(`Connecting to peripheral ${peripheralAddress} (rssi=${rssi ?? "n/a"}) via proxy`);
 
         // 1. Connect
+        ensureActive();
         const { connection_handle, mtu: peripheralMtu } = await connection.sendCommand(BleProxyCommand.Connect, {
             address: peripheralAddress,
         });
@@ -103,12 +113,16 @@ export class ProxyBleCentralInterface implements Transport {
         // The owner connection's observables outlive a failed open; a leaked observer would corrupt
         // the next channel on the same connection. Detach on every exit path; assigned once registered.
         let detachObservers: (() => void) | undefined;
+        let btpSession: BtpSessionHandler | undefined;
+        let transportDisconnected = false;
 
         try {
             // 2. Discover services
+            ensureActive();
             const { services } = await connection.sendCommand(BleProxyCommand.DiscoverServices, {
                 connection_handle,
             });
+            ensureActive();
 
             const matterService = services.find(s => MatterBle.isServiceUuid(s.uuid));
             if (!matterService) {
@@ -120,6 +134,7 @@ export class ProxyBleCentralInterface implements Transport {
                 connection_handle,
                 service_uuid: matterService.uuid,
             });
+            ensureActive();
 
             let c1Uuid: string | undefined;
             let c2Uuid: string | undefined;
@@ -147,6 +162,7 @@ export class ProxyBleCentralInterface implements Transport {
                     connection_handle,
                     characteristic_uuid: c3Uuid,
                 });
+                ensureActive();
             }
 
             // 5. Register the handshake observer BEFORE sending: the C2 indication is a separate
@@ -207,6 +223,7 @@ export class ProxyBleCentralInterface implements Transport {
                 connection.binaryFrameReceived.off(handshakeObserver);
                 btpHandshakeTimeout.stop();
             }
+            ensureActive();
 
             // 7. Register the live observer BEFORE creating the session (same non-buffering frame
             // race as step 5); frames seen before the session exists are buffered, then flushed below.
@@ -237,7 +254,7 @@ export class ProxyBleCentralInterface implements Transport {
             detachObservers = () => connection.binaryFrameReceived.off(binaryObserver);
 
             // 8. Create the BTP session.
-            const btpSession = await BtpSessionHandler.createAsCentral(
+            btpSession = await BtpSessionHandler.createAsCentral(
                 handshakeResponse,
                 // Write callback: send binary frame to proxy client
                 async (data: Bytes) => {
@@ -246,7 +263,8 @@ export class ProxyBleCentralInterface implements Transport {
                 },
                 // Disconnect callback
                 async () => {
-                    if (!channelRef.channel?.connected) return;
+                    if (transportDisconnected || !connection.connected) return;
+                    transportDisconnected = true;
                     logger.debug(`Disconnecting from ${peripheralAddress} via proxy`);
                     try {
                         await connection.sendCommand(BleProxyCommand.Disconnect, { connection_handle });
@@ -281,6 +299,7 @@ export class ProxyBleCentralInterface implements Transport {
                     data.connection_handle === connection_handle
                 ) {
                     logger.info(`Peripheral ${peripheralAddress} disconnected unexpectedly`);
+                    transportDisconnected = true;
                     channelRef.channel?.markDisconnected();
                     channelRef.channel
                         ?.close()
@@ -292,6 +311,7 @@ export class ProxyBleCentralInterface implements Transport {
             // The Disconnected event covers one peripheral; this covers the whole owning client vanishing.
             const ownerClosedObserver = () => {
                 logger.info(`Owning proxy client for ${peripheralAddress} disconnected`);
+                transportDisconnected = true;
                 channelRef.channel?.markDisconnected();
                 channelRef.channel
                     ?.close()
@@ -305,12 +325,23 @@ export class ProxyBleCentralInterface implements Transport {
                 connection.closed.off(ownerClosedObserver);
             };
 
+            ensureActive();
             const proxyChannel = new ProxyBleChannel(peripheralAddress, btpSession, detachObservers);
             channelRef.channel = proxyChannel;
+            this.#handler.trackChannel(proxyChannel);
             return proxyChannel;
         } catch (error) {
             // Clean up on failure — detach observers and best-effort tear-down on the proxy side
             detachObservers?.();
+            if (btpSession !== undefined) {
+                // Stops the session's ack timers; the Disconnect below is the only one sent.
+                transportDisconnected = true;
+                await btpSession
+                    .close()
+                    .catch(closeError =>
+                        logger.debug(`Peripheral ${peripheralAddress}: Error closing BTP session`, closeError),
+                    );
+            }
             try {
                 await connection.sendCommand(BleProxyCommand.Disconnect, { connection_handle });
             } catch (cleanupError) {

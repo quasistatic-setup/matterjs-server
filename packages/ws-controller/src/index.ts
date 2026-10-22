@@ -42,6 +42,7 @@ export * from "./types/WebServer.js";
 
 // Export message types
 export * from "./types/CommandHandler.js";
+export * from "./types/BleProxyCommissioning.js";
 export * from "./types/WebSocketMessageTypes.js";
 
 // Export utilities
