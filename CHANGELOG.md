@@ -7,6 +7,15 @@ This page shows a detailed overview of the changes between versions without the 
 	## **WORK IN PROGRESS**
 -->
 
+## **WORK IN PROGRESS**
+
+- Feature: Commissioning through one selected BLE proxy client. Details are in [docs/ble-proxy-protocol.md](docs/ble-proxy-protocol.md#selecting-one-proxy-for-commissioning) and [docs/websockets_api.md](docs/websockets_api.md#commissioning)
+    - A BLE proxy client that sends the handshake feature `proxy_identity` gets a `proxy_id` for its connection
+    - `commission_with_code` takes an optional `ble_proxy_id`; the attempt then scans and connects only through that proxy and holds it until it has settled. `server_info.ble_proxy_selection` says whether the server supports it
+    - Adds the WebSocket command `cancel_commissioning`; only the connection that started the attempt can cancel it, and closing that connection also ends the attempt
+    - Adds error code 107 (`BleProxyBusy`) in the server and both clients
+    - The TypeScript client has `bleProxyId` in the commissioning options and `cancelCommissioning`; the Python client has `ble_proxy_id` in `commission_with_code` and `cancel_commissioning`
+
 ## 1.5.2 (2026-10-21)
 
 - Fix: Events with a delta timestamp are processed with the calculated device time again instead of the time the server received them
