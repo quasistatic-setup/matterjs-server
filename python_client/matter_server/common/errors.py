@@ -292,6 +292,15 @@ def _occupying_stream(value: Any) -> CameraOccupyingStream | None:
     return CameraOccupyingStream(kind=kind, stream_id=stream_id, reference_count=reference_count)
 
 
+class BleProxyBusy(MatterError):
+    """Error raised when the selected BLE proxy is still held by another commissioning attempt.
+
+    OHF extension (python-matter-server codes stop at 11). Retry once the earlier attempt has released the proxy.
+    """
+
+    error_code = 107
+
+
 def exception_from_error_code(error_code: int) -> type[MatterError]:
     """Return correct Exception class from error_code."""
     return ERROR_MAP.get(error_code, MatterError)

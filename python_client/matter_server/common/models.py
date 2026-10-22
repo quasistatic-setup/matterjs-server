@@ -41,6 +41,7 @@ class APICommand(str, Enum):
     GET_NODES = "get_nodes"
     GET_NODE = "get_node"
     COMMISSION_WITH_CODE = "commission_with_code"
+    CANCEL_COMMISSIONING = "cancel_commissioning"
     COMMISSION_ON_NETWORK = "commission_on_network"
     SET_WIFI_CREDENTIALS = "set_wifi_credentials"
     SET_THREAD_DATASET = "set_thread_dataset"
@@ -248,6 +249,7 @@ class ServerInfoMessage:
     bluetooth_enabled: bool
     wifi_ssid: str | None = None
     ble_proxy_enabled: bool = False
+    ble_proxy_selection: bool = False
 
 
 MessageType = CommandMessage | EventMessage | SuccessResultMessage | ErrorResultMessage | ServerInfoMessage

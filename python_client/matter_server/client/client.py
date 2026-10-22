@@ -213,6 +213,7 @@ class MatterClient:
         wifi_credentials_id: str | None = None,
         thread_dataset_id: str | None = None,
         discovery_timeout_s: float | None = None,
+        ble_proxy_id: str | None = None,
     ) -> MatterNodeData:
         """
         Commission a device using a QR Code or Manual Pairing Code.
@@ -223,26 +224,53 @@ class MatterClient:
         :param thread_dataset_id: Optional id of the Thread dataset entry to use.
         :param discovery_timeout_s: Optional seconds to find and pair with the device, at most 172800.
             Needs schema 14. Without it the server searches for 3 minutes.
+        :param ble_proxy_id: Explicit proxy for this operation; requires the advertised
+            ble_proxy_selection capability and network_only=False.
 
         :return: The NodeInfo of the commissioned device.
         """
         extra: dict[str, str] = {}
+        if ble_proxy_id is not None:
+            self._require_ble_proxy_selection()
+            if network_only:
+                raise ValueError("BLE proxy selection requires network_only=False")
+            extra["ble_proxy_id"] = ble_proxy_id
         if wifi_credentials_id is not None:
             extra["wifi_credentials_id"] = wifi_credentials_id
         if thread_dataset_id is not None:
             extra["thread_dataset_id"] = thread_dataset_id
-        require_schema = 12 if extra else (6 if network_only else None)
+        uses_credential_ids = wifi_credentials_id is not None or thread_dataset_id is not None
+        require_schema = 12 if uses_credential_ids else (6 if network_only else None)
         if discovery_timeout_s is not None:
             require_schema = 14
-        data = await self.send_command(
-            APICommand.COMMISSION_WITH_CODE,
-            require_schema=require_schema,
-            code=code,
-            network_only=network_only,
-            **extra,
-            **({} if discovery_timeout_s is None else {"discovery_timeout_s": discovery_timeout_s}),
-        )
+        try:
+            data = await self.send_command(
+                APICommand.COMMISSION_WITH_CODE,
+                require_schema=require_schema,
+                code=code,
+                network_only=network_only,
+                **extra,
+                **({} if discovery_timeout_s is None else {"discovery_timeout_s": discovery_timeout_s}),
+            )
+        except asyncio.CancelledError:
+            if ble_proxy_id is not None:
+                try:
+                    async with asyncio.timeout(5):
+                        await self.cancel_commissioning(ble_proxy_id)
+                except Exception:
+                    logging.getLogger(__package__).debug("Selected-proxy cancellation request could not be sent")
+            raise
         return dataclass_from_dict(MatterNodeData, data)
+
+    def _require_ble_proxy_selection(self) -> None:
+        if self.server_info is None or self.server_info.ble_proxy_selection is not True:
+            raise ServerVersionTooOld("Server does not support explicit BLE proxy selection")
+
+    async def cancel_commissioning(self, ble_proxy_id: str) -> bool:
+        """Cancel a selected-proxy operation owned by this client's control connection."""
+        self._require_ble_proxy_selection()
+        result = await self.send_command(APICommand.CANCEL_COMMISSIONING, ble_proxy_id=ble_proxy_id)
+        return bool(result["canceled"])
 
     async def commission_on_network(
         self,
