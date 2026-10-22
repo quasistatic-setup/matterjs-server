@@ -62,6 +62,9 @@ export class MockMatterServer {
             wifi_credentials_set: options.serverInfo?.wifi_credentials_set ?? false,
             thread_credentials_set: options.serverInfo?.thread_credentials_set ?? false,
             bluetooth_enabled: options.serverInfo?.bluetooth_enabled ?? false,
+            ...(options.serverInfo?.ble_proxy_selection === undefined
+                ? {}
+                : { ble_proxy_selection: options.serverInfo.ble_proxy_selection }),
         };
     }
 

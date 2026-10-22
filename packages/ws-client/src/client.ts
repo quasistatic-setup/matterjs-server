@@ -67,6 +67,8 @@ export const DEFAULT_COMMAND_TIMEOUT = 5 * 60 * 1000;
 
 /** Options for {@link MatterClient.commissionWithCode}. */
 export interface CommissionWithCodeOptions {
+    /** Requires server_info.ble_proxy_selection and networkOnly false. */
+    bleProxyId?: string;
     /** Stored WiFi credential id to use (schema 12; omit for the reserved `default` entry). */
     wifiCredentialsId?: string;
     /** Stored Thread dataset id to use (schema 12; omit for the reserved `default` entry). */
@@ -317,6 +319,12 @@ export class MatterClient {
         optsOrTimeout?: number | CommissionWithCodeOptions,
     ): Promise<MatterNode> {
         const opts = typeof optsOrTimeout === "number" ? { timeout: optsOrTimeout } : (optsOrTimeout ?? {});
+        if (opts.bleProxyId !== undefined) {
+            if (networkOnly) throw new Error("BLE proxy selection requires networkOnly false");
+            if (this.connection.serverInfo?.ble_proxy_selection !== true) {
+                throw new InvalidServerVersion("Server does not support explicit BLE proxy selection");
+            }
+        }
         const usesIds = opts.wifiCredentialsId !== undefined || opts.threadDatasetId !== undefined;
         const data = await this.sendCommand(
             "commission_with_code",
@@ -325,12 +333,21 @@ export class MatterClient {
                 code,
                 network_only: networkOnly,
                 wifi_credentials_id: opts.wifiCredentialsId,
+                ble_proxy_id: opts.bleProxyId,
                 thread_dataset_id: opts.threadDatasetId,
                 discovery_timeout_s: opts.discoveryTimeoutS,
             },
             opts.timeout,
         );
         return new MatterNode(data);
+    }
+
+    /** Cancels a selected-proxy operation started on this client's control connection. */
+    async cancelCommissioning(bleProxyId: string): Promise<boolean> {
+        if (this.connection.serverInfo?.ble_proxy_selection !== true) {
+            throw new InvalidServerVersion("Server does not support explicit BLE proxy selection");
+        }
+        return (await this.sendCommand("cancel_commissioning", 0, { ble_proxy_id: bleProxyId })).canceled;
     }
 
     /** Commissions a device that is already on the network, found by setup PIN code and optional filter or IP. */
